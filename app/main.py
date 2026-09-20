@@ -6,6 +6,7 @@ import base64
 import binascii
 import json
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -575,6 +576,14 @@ async def ingest_event(request: Request, response: Response) -> dict:
         ts = float(timestamp_h)
     except ValueError:
         raise HTTPException(400, "X-Webhook-Timestamp must be a Unix timestamp in seconds")
+    if not math.isfinite(ts):
+        # float() accepts "NaN" and "Infinity", and overflowing literals such
+        # as "1e400" parse to inf without raising. NaN would make every skew
+        # comparison below False and silently disable the replay window, so
+        # only finite decimal Unix seconds are accepted.
+        raise HTTPException(
+            400, "X-Webhook-Timestamp must be a finite Unix timestamp in seconds"
+        )
 
     skew = abs(time.time() - ts)
     if skew > config.INGEST_TIMESTAMP_TOLERANCE:

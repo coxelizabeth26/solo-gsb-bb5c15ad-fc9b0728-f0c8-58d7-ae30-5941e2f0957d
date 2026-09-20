@@ -10,7 +10,7 @@
 - **按订阅投递熔断器**：同一订阅连续最终失败达到 `BREAKER_FAILURE_THRESHOLD` 次即原子熔断（`open`），熔断期间事件照常入库但工作器不再领取；冷却 `BREAKER_COOLDOWN_SECONDS` 秒后仅放行最早待投递任务作为唯一 half-open 探针——成功则关闭并清零计数，失败则重新熔断并刷新冷却时间；状态持久化在 SQLite 中，重启后保持
 - **按订阅令牌桶限流**：`PUT /subscriptions/{id}/rate-policy` 为订阅设置持续速率（`rate_per_second`，令牌/秒，支持小数）与突发容量（`burst`，桶容量）；工作器每次认领在同一数据库临界区内惰性补充并原子扣取一个令牌，多工作器（含多进程）不会重复扣用同一令牌。无整令牌时队首任务保持 `pending`，其 `next_attempt_at` 被推到由持久化余额**确定性计算**出的下一令牌可用时刻（`now + (1 − 余额)/rate`），不依赖进程内定时器；被限流订阅会在同一次认领中跳过、转投其它订阅。桶容量、补充速率、余额及余额时间戳全部持久化在 SQLite 中，服务重启与多工作器并发下限流状态一致；令牌仅在队首任务（严格有序）处扣取，故绝不破坏同订阅有序投递。`GET` 查询实时余额与下一令牌时间，`DELETE` 关闭限流（桶在安装/替换策略时重置为满）
 - **按订阅投递时段（delivery window）**：`PUT /subscriptions/{id}/delivery-window` 配置 IANA 时区（如 `Asia/Shanghai` / `America/New_York`）、允许投递的星期（ISO 编号 1=周一 … 7=周日，可多选）与本地起止时间（`HH:MM` 或 `HH:MM:SS`，半开区间 `[start, end)`；结束时间不晚于开始时间即**跨午夜**窗口，如 `22:00-06:00`）。工作器只在开放时段认领该订阅的队首任务；窗口关闭时队首任务保持 `pending`，其 `next_attempt_at` 在原子认领临界区内被**确定性推进到下次开放时刻**（绝对 UTC epoch；每次开放绑定到明确的 UTC 起止瞬间，按 IANA 时区库从原理上正确处理跨午夜、春令跳空与秋令重复小时——结束时刻落入重复小时时在第一次到达即关闭，第二次经过不重开），随后继续认领其它订阅。调度时间与配置均持久化在 SQLite 中，无进程内定时器，**重启不会提前投递**；窗口门控先于令牌桶判定（关闭期间不消耗令牌），并与严格有序、限流、熔断 half-open 探针、退避重试、暂停/恢复链路叠加生效。`GET` 实时返回 `is_open_now` / `next_open_at`（只读现算、不写库），`DELETE` 移除时段（不提前改写既有任务调度）
-- **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗
+- **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗；时间戳仅接受有限的十进制 Unix 秒值（`NaN`/`Infinity`/溢出值返回 `400`）
 - **入站幂等与防重放**：已接收的 `X-Webhook-Id` 持久化在 SQLite 中；重复 ID + 相同内容返回首次接收结果且不重复投递，相同 ID 不同内容返回 `409`
 - **事件定时投递**：`POST /events` 支持可选 `deliver_at`（带时区的未来 ISO-8601 时间，如 `2026-09-20T09:00:00Z`；省略或为 `null` 表示立即投递）。计划时间持久化到任务，工作器在到点前绝不认领（无内存定时器，重启同样生效）；同订阅严格按 `task_id` 有序，因此较早的定时任务会阻塞其后的所有任务（包括立即投递的任务），直到该定时任务投递成功、最终失败或被撤销。`GET /events/{id}` 返回每个任务的 `deliver_at`；缺少时区、过去时间、非法格式均返回 `422`
 - **持久化主题发布（pub/sub）**：`PUT /subscriptions/{id}/topics` 以替换语义维护订阅的去重主题集合（`GET` 查询、空列表清空）；`POST /topic-events` 提交 `event_id`、`topic`、`payload`，在**单个 SQLite 事务**中快照该主题当前全部订阅并为每个订阅生成一条普通投递任务（任务随后完全复用有序、限流、熔断、重试链路）。幂等键为 `(event_id, topic, payload)`：相同三元组重放返回**首次**收件人与任务结果（即使主题成员已变化也不新增、不漏投）；同一 `event_id` 主题不同或内容不同返回 `409`；主题无订阅者返回 `422` 且不落库；主题事件与 `POST /events`、`POST /ingest` 共享事件 ID 命名空间，跨通道复用同一 ID 互返 `409`
@@ -124,7 +124,7 @@ curl -s -X POST http://localhost:8000/subscriptions \
 
 | 头部 | 说明 |
 |------|------|
-| `X-Webhook-Timestamp` | 发送时刻 Unix 时间戳（秒），与服务端时差不得超过 **±300 秒** |
+| `X-Webhook-Timestamp` | 发送时刻 Unix 时间戳（有限的十进制秒值；`NaN`、`Infinity`、溢出值一律 `400`），与服务端时差不得超过 **±300 秒** |
 | `X-Webhook-Id` | 事件唯一 ID（最长 128 字符），用于幂等去重 |
 | `X-Webhook-Signature` | `sha256=<HMAC-SHA256(secret, timestamp + "." + id + "." + 原始请求体)>` |
 
@@ -164,7 +164,8 @@ sig = "sha256=" + hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
 - **重复 ID + 相同原始 body**：`200 OK`，返回与首次完全一致的接收结果，**不会重复创建投递任务**（含并发重试：多个相同请求同时到达也只有一个 `201`）。
 - **相同 ID 但 body 不同**：`409 Conflict`，不产生任何任务。
 - **签名错误**（含签名未覆盖时间戳/ID/原始 body）：`401 Unauthorized`。
-- **时间戳超出 ±300 秒窗口**或无法解析：`401 Unauthorized`。
+- **时间戳超出 ±300 秒窗口**：`401 Unauthorized`。
+- **时间戳无法解析**（非十进制秒值）**或不是有限值**：`400 Bad Request`。`NaN`、`Infinity`/`inf`（含正负号）以及溢出为无穷大的字面值（如 `1e400`、超长数字串）虽然能被浮点解析接受，但一律按 `400` 拒绝——`NaN` 会使时差比较恒为假从而绕过时间窗，必须显式拦截；合法有限值仍按**原始头文本**参与 HMAC 验签（如 `+1726843200`、`1.7268432e9` 等写法按发送原文验签，不做数值规范化）。
 - **缺少必需头部**、空 body、body 非 JSON：`400 Bad Request`；body 缺少 `subscription_ids`：`422`。
 - **包含不存在的订阅 ID**：`400 Bad Request`，且该事件不会持久化。
 - 服务端未配置 `INGEST_SECRET` 时端点失败关闭，返回 `503`。
@@ -803,7 +804,8 @@ app/
 └── config.py          # 环境变量配置
 tests/
 ├── test_db_migrations.py        # 启动迁移版本链：新库直达、旧库升级保数据、步骤事务原子性、并发串行、外键检查拒绝启动
-└── test_delivery_window_dst.py # 投递时段 DST 回归（秋令回拨两个 fold、春令跳空、星期归属、认领/限流顺序）
+├── test_delivery_window_dst.py # 投递时段 DST 回归（秋令回拨两个 fold、春令跳空、星期归属、认领/限流顺序）
+└── test_ingest_timestamp.py    # /ingest 时间戳校验回归（NaN/Infinity/溢出值 400、±300s 边界、按原始头文本验签）
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -6,6 +6,7 @@ import base64
 import binascii
 import json
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -71,6 +72,30 @@ def _decode_cursor(cursor: str) -> tuple[float, int]:
             400, "invalid cursor: pass the next_cursor value returned by the previous page"
         )
     return float(updated_at), task_id
+
+
+def _parse_ingest_timestamp(value: str) -> float:
+    """Parse the X-Webhook-Timestamp header to finite Unix epoch seconds.
+
+    Only finite decimal values are accepted: float() alone is not enough
+    because it parses 'NaN'/'Infinity' (and silently turns overflow such as
+    '1e999' into inf), and NaN would poison the skew check -- every
+    comparison against nan is false, so the +/-300s window is bypassed and
+    the request proceeds to signature verification (and possibly storage).
+    Non-finite values, like unparseable ones, are a malformed request (400);
+    a finite value that parses but lies outside the window stays a 401.
+    """
+    try:
+        ts = float(value)
+    except ValueError:
+        raise HTTPException(
+            400, "X-Webhook-Timestamp must be a finite Unix timestamp in seconds"
+        )
+    if not math.isfinite(ts):
+        raise HTTPException(
+            400, "X-Webhook-Timestamp must be a finite Unix timestamp in seconds"
+        )
+    return ts
 
 
 def _parse_audit_time(value: str, param: str) -> float:
@@ -571,10 +596,10 @@ async def ingest_event(request: Request, response: Response) -> dict:
         raise HTTPException(400, "X-Webhook-Id too long (max 128 characters)")
 
     timestamp_h = timestamp_h.strip()
-    try:
-        ts = float(timestamp_h)
-    except ValueError:
-        raise HTTPException(400, "X-Webhook-Timestamp must be a Unix timestamp in seconds")
+    # Must parse to a *finite* number before the window check: NaN/Infinity
+    # (or an overflow that parses to inf) must not reach the skew comparison,
+    # where NaN would make abs(now - ts) > tolerance false and bypass it.
+    ts = _parse_ingest_timestamp(timestamp_h)
 
     skew = abs(time.time() - ts)
     if skew > config.INGEST_TIMESTAMP_TOLERANCE:
